@@ -1,0 +1,270 @@
+`timescale 1ns/1ps
+module i2c_master_rw #(
+  parameter integer CLK_FREQ_HZ = 100_000_000,
+  parameter integer I2C_FREQ_HZ = 100_000
+)(
+  input  wire        clk, rst_n,
+  input  wire        start,          // pulse 1 clk to begin
+  input  wire        rw,             // 0=write, 1=read
+  input  wire [6:0]  addr7,
+  input  wire [7:0]  wr_data,
+  input  wire        wr_valid,       // must be 1 with start
+  output reg         busy,
+  output reg         ack_error,
+  output reg  [7:0]  rd_data,
+  output reg         rd_valid,
+  inout  wire        sda,
+  inout  wire        scl
+);
+
+  // open-drain pads
+  reg sda_oe, scl_oe;                    // 1=pull low, 0=release (Z)
+  assign sda = sda_oe ? 1'b0 : 1'bz;
+  assign scl = scl_oe ? 1'b0 : 1'bz;
+  wire sda_in = sda;
+
+  // half-period tick
+  localparam integer HALF = (CLK_FREQ_HZ/(2*I2C_FREQ_HZ));
+  reg  [31:0] div_q; reg tick;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin div_q<=0; tick<=1'b0; end
+    else if (busy) begin
+      if (div_q==0) begin div_q <= (HALF>0)? (HALF-1):0; tick<=1'b1; end
+      else begin div_q <= div_q-1; tick<=1'b0; end
+    end else begin div_q<=0; tick<=1'b0; end
+  end
+
+  // FSM + SCL phase
+  localparam [2:0] ST_IDLE=3'd0, ST_START_HI=3'd1, ST_SEND=3'd2, ST_ACK=3'd3, ST_STOP_LO=3'd4, ST_STOP_HI=3'd5;
+  reg [2:0] state;
+  reg phase, phase_en;                   // phase: 0=SCL low, 1=SCL high
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) phase<=1'b1; else if (phase_en && tick) phase<=~phase;
+  end
+
+  // datapath/control
+  reg [7:0] shifter, rd_shift;
+  reg [3:0] bitcnt;
+  reg sent_addr, reading;
+  reg read_primed;                       // saw first LOW after entering READ
+  reg read_skip;                         // NEW: skip the first HIGH sample
+
+  // drive policy
+  always @* begin
+    sda_oe = 1'b0; scl_oe = 1'b0;
+    case (state)
+      ST_IDLE:     ;
+      ST_START_HI: sda_oe = 1'b1;                          // START: SDA low while SCL high
+      ST_SEND:     begin scl_oe=(phase==1'b0); sda_oe = reading ? 1'b0 : ~shifter[7]; end
+      ST_ACK:      begin scl_oe=(phase==1'b0); sda_oe = 1'b0; end // release for ACK/NACK
+      ST_STOP_LO:  begin scl_oe=(phase==1'b0); sda_oe = 1'b1; end
+      ST_STOP_HI:  begin scl_oe=(phase==1'b0); sda_oe = (phase==1'b1)?1'b0:1'b1; end
+      default:     ;
+    endcase
+  end
+
+  // sequencing
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      state<=ST_IDLE; busy<=1'b0; ack_error<=1'b0; rd_valid<=1'b0; rd_data<=8'h00;
+      shifter<=8'h00; rd_shift<=8'h00; bitcnt<=4'd0; sent_addr<=1'b0;
+      reading<=1'b0; read_primed<=1'b0; read_skip<=1'b0; phase_en<=1'b0; phase<=1'b1;
+    end else begin
+      rd_valid <= 1'b0;
+
+      case (state)
+        ST_IDLE: begin
+          busy<=1'b0; phase_en<=1'b0; phase<=1'b1; reading<=1'b0; read_primed<=1'b0; read_skip<=1'b0;
+          if (start && wr_valid) begin
+            shifter <= {addr7, rw}; bitcnt<=4'd7; sent_addr<=1'b0; ack_error<=1'b0;
+            busy<=1'b1; state<=ST_START_HI;
+          end
+        end
+
+        ST_START_HI: if (tick) begin phase_en<=1'b1; phase<=1'b0; state<=ST_SEND; end
+
+        ST_SEND: begin
+          if (!reading) begin
+            // transmit: advance at end of HIGH
+            if (tick && phase==1'b1) begin
+              if (bitcnt==0) state<=ST_ACK;
+              else begin shifter<={shifter[6:0],1'b0}; bitcnt<=bitcnt-1'b1; end
+            end
+          end else begin
+            // READ: wait a LOW, then skip first HIGH, then sample on HIGHs
+            if (tick && phase==1'b0) read_primed <= 1'b1;         // saw a LOW
+            if (tick && phase==1'b1 && read_primed) begin
+              if (read_skip) begin
+                // ignore this first HIGH to avoid race with TB's first fall drive
+                read_skip <= 1'b0;
+              end else begin
+                rd_shift <= {rd_shift[6:0], sda_in};              // MSB-first: shift-left, insert LSB
+                if (bitcnt==0) state<=ST_ACK; else bitcnt<=bitcnt-1'b1;
+              end
+            end
+          end
+        end
+
+        ST_ACK: if (tick && phase==1'b1) begin
+          if (!sent_addr) begin
+            if (sda_in) ack_error<=1'b1;       // NACK on address
+            sent_addr<=1'b1;
+            if (rw==1'b0) begin
+              shifter<=wr_data; bitcnt<=4'd7; reading<=1'b0; read_primed<=1'b0; read_skip<=1'b0; state<=ST_SEND;
+            end else begin
+              rd_shift<=8'h00; bitcnt<=4'd7; reading<=1'b1; read_primed<=1'b0; read_skip<=1'b1; state<=ST_SEND;
+            end
+          end else begin
+            if (rw==1'b0) begin
+              if (sda_in) ack_error<=1'b1;     // NACK on data
+              state<=ST_STOP_LO;
+            end else begin
+              rd_data<=rd_shift; rd_valid<=1'b1; state<=ST_STOP_LO;
+            end
+          end
+        end
+
+        ST_STOP_LO: if (phase==1'b1) state<=ST_STOP_HI;
+        ST_STOP_HI: if (tick) begin state<=ST_IDLE; phase_en<=1'b0; end
+        default: state<=ST_IDLE;
+      endcase
+    end
+  end
+endmodule
+
+
+
+
+
+// tb_i2c_master_rw_min.v
+`timescale 1ns/1ps
+
+module tb_i2c_master_rw_min;
+
+  reg clk = 0; always #5 clk = ~clk;   // 100 MHz
+  reg rst_n = 0;
+
+  wire sda, scl;
+  pullup(sda);
+  pullup(scl);
+
+  reg        start    = 0;
+  reg        rw       = 0;            // 0=write, 1=read
+  reg [6:0]  addr7    = 7'h48;
+  reg [7:0]  wr_data  = 8'hA5;
+  reg        wr_valid = 0;
+  wire       busy, ack_error;
+  wire [7:0] rd_data;
+  wire       rd_valid;
+
+  i2c_master_rw #(
+    .CLK_FREQ_HZ(100_000_000),
+    .I2C_FREQ_HZ(100_000)
+  ) dut (
+    .clk(clk), .rst_n(rst_n),
+    .start(start), .rw(rw),
+    .addr7(addr7), .wr_data(wr_data), .wr_valid(wr_valid),
+    .busy(busy), .ack_error(ack_error),
+    .rd_data(rd_data), .rd_valid(rd_valid),
+    .sda(sda), .scl(scl)
+  );
+
+  // --- tiny slave: ACKs & returns 0x3C on READ ---
+  localparam [7:0] SLAVE_RD_VALUE = 8'h3C;
+
+  reg slave_pull_low = 1'b0;          // 1=pull SDA low, 0=release
+  assign sda = slave_pull_low ? 1'b0 : 1'bz;
+
+  reg scl_q = 1'b1;
+  always @(posedge clk) scl_q <= scl;
+  wire scl_rise = (scl_q==1'b0 && scl==1'b1);
+  wire scl_fall = (scl_q==1'b1 && scl==1'b0);
+
+  integer rise_cnt = 0;
+  reg     in_read  = 1'b0;
+  reg [2:0] bitpos = 3'd0;
+  reg [7:0] rd_pat = SLAVE_RD_VALUE;
+
+  always @(posedge clk) begin
+    if (!rst_n || !busy) begin
+      slave_pull_low <= 1'b0;
+      rise_cnt       <= 0;
+      in_read        <= 1'b0;
+      bitpos         <= 3'd0;
+      rd_pat         <= SLAVE_RD_VALUE;
+    end else begin
+      if (scl_rise) begin
+        rise_cnt <= rise_cnt + 1;
+
+        if (rise_cnt==8) slave_pull_low <= 1'b1;        // ACK address (9th high)
+        if (rise_cnt==9) begin
+          slave_pull_low <= 1'b0;                       // release after ACK
+          in_read        <= (rw==1'b1);
+          bitpos         <= 0;
+          rd_pat         <= SLAVE_RD_VALUE;
+        end
+
+        if (!in_read) begin
+          if (rise_cnt==17) slave_pull_low <= 1'b1;     // ACK write data (18th high)
+          if (rise_cnt==18) slave_pull_low <= 1'b0;
+        end else begin
+          if (bitpos<4'd8) bitpos <= bitpos + 1'b1;
+          else begin
+            // 9th (ACK/NACK) rising: master NACKs; we release
+            slave_pull_low <= 1'b0;
+            in_read        <= 1'b0;
+          end
+        end
+      end
+
+      // READ: drive next bit only when SCL is LOW (spec-correct)
+      if (in_read && scl_fall && bitpos<4'd8) begin
+        slave_pull_low <= (rd_pat[7]==1'b0);            // 0→pull, 1→release
+        rd_pat         <= {rd_pat[6:0],1'b0};           // MSB-first pattern
+      end
+    end
+  end
+
+  integer to_cnt;
+
+  initial begin
+    $display("==== SIMPLE I2C TEST START ====");
+    repeat (10) @(posedge clk); rst_n = 1;
+    repeat (20) @(posedge clk);
+
+    // WRITE
+    rw       = 1'b0;
+    wr_valid = 1'b1;
+    start    = 1'b1; @(posedge clk); start = 1'b0;
+    to_cnt=0; while (!busy && to_cnt<100000) begin @(posedge clk); to_cnt=to_cnt+1; end
+    to_cnt=0; while ( busy && to_cnt<100000) begin @(posedge clk); to_cnt=to_cnt+1; end
+    if (ack_error) $display("WRITE: NACK error!");
+    else           $display("WRITE: OK  (addr=0x%02h data=0x%02h)", addr7, wr_data);
+
+    // READ
+    rw       = 1'b1;
+    wr_valid = 1'b1;                 // MUST be 1 with start
+    start    = 1'b1; @(posedge clk); start = 1'b0;
+    to_cnt=0; while (!busy && to_cnt<100000)  begin @(posedge clk); to_cnt=to_cnt+1; end
+    to_cnt=0; while (!rd_valid && to_cnt<200000) begin @(posedge clk); to_cnt=to_cnt+1; end
+    if (rd_valid)
+      $display("READ : got 0x%02h (expected 0x%02h)", rd_data, SLAVE_RD_VALUE);
+    else
+      $display("READ : TIMEOUT waiting for rd_valid!");
+    to_cnt=0; while ( busy && to_cnt<100000) begin @(posedge clk); to_cnt=to_cnt+1; end
+
+    $display("==== TEST DONE ====");
+    #200 $finish;
+  end
+
+endmodule
+
+
+
+
+
+
+
+
+
+

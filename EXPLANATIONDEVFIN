@@ -1,0 +1,737 @@
+`timescale 1ns/1ps
+
+Tell the simulator: 1 time unit = 1 ns; timestamp precision = 1 ps.
+
+module i2c_master_rw #(
+  parameter integer CLK_FREQ_HZ = 100_000_000,
+  parameter integer I2C_FREQ_HZ = 100_000
+)(
+
+Start the module. Two parameters:
+
+    CLK_FREQ_HZ: your FPGA/system clock (default 100 MHz).
+
+    I2C_FREQ_HZ: desired I²C SCL rate (default 100 kHz).
+
+  input  wire        clk, rst_n,
+
+System clock and active-low reset.
+
+  input  wire        start,          // pulse 1 clk to begin
+  input  wire        rw,             // 0=write, 1=read
+  input  wire [6:0]  addr7,
+  input  wire [7:0]  wr_data,
+  input  wire        wr_valid,       // must be 1 with start
+
+Command interface:
+
+    start: 1-cycle pulse to kick off a transaction.
+
+    rw: direction (0 = write, 1 = read).
+
+    addr7: 7-bit slave address.
+
+    wr_data: byte to write (for write ops).
+
+    wr_valid: must be 1 in the same cycle as start.
+
+  output reg         busy,
+  output reg         ack_error,
+  output reg  [7:0]  rd_data,
+  output reg         rd_valid,
+
+Status/results:
+
+    busy: high while a transfer is running.
+
+    ack_error: latched if the slave NACKs.
+
+    rd_data: captured read byte.
+
+    rd_valid: 1-cycle pulse when rd_data is ready.
+
+  inout  wire        sda,
+  inout  wire        scl
+);
+
+I²C open-drain bus pins.
+Open-drain pads (drive low or release)
+
+reg sda_oe, scl_oe;                    // 1=pull low, 0=release (Z)
+assign sda = sda_oe ? 1'b0 : 1'bz;
+assign scl = scl_oe ? 1'b0 : 1'bz;
+wire sda_in = sda;
+
+    sda_oe/scl_oe act like “pull-down enables”.
+
+    When 1 → drive line low. When 0 → tri-state (external pull-ups make it high).
+
+    sda_in reads the current SDA level (used for ACKs and read bits).
+
+Half-period tick generator (sets SCL rate)
+
+localparam integer HALF = (CLK_FREQ_HZ/(2*I2C_FREQ_HZ));
+reg  [31:0] div_q; reg tick;
+
+Number of system clocks per half I²C period. tick will pulse once per half-period.
+
+always @(posedge clk or negedge rst_n) begin
+  if (!rst_n) begin div_q<=0; tick<=1'b0; end
+  else if (busy) begin
+    if (div_q==0) begin div_q <= (HALF>0)? (HALF-1):0; tick<=1'b1; end
+    else begin div_q <= div_q-1; tick<=1'b0; end
+  end else begin div_q<=0; tick<=1'b0; end
+end
+
+    While busy, count down to 0; when 0 → reload and assert tick for 1 cycle.
+
+    When idle/reset → no ticking.
+
+FSM state encoding and SCL phase
+
+localparam [2:0] ST_IDLE=3'd0, ST_START_HI=3'd1, ST_SEND=3'd2, ST_ACK=3'd3, ST_STOP_LO=3'd4, ST_STOP_HI=3'd5;
+reg [2:0] state;
+
+States:
+
+    IDLE → bus free
+
+    START_HI → generate START (SDA low while SCL high)
+
+    SEND → send 8 bits (addr or write data) or receive 8 bits (read)
+
+    ACK → 9th bit slot (slave ACK or master NACK after read)
+
+    STOP_LO/STOP_HI → generate STOP
+
+reg phase, phase_en;                   // phase: 0=SCL low, 1=SCL high
+always @(posedge clk or negedge rst_n) begin
+  if (!rst_n) phase<=1'b1; else if (phase_en && tick) phase<=~phase;
+end
+
+SCL “phase” flops:
+
+    phase==0 → we drive SCL low.
+
+    phase==1 → we release SCL (goes high).
+
+    Toggles on each tick while phase_en is set.
+
+Datapath/flags for bits
+
+reg [7:0] shifter, rd_shift;
+reg [3:0] bitcnt;
+reg sent_addr, reading;
+reg read_primed;   // saw first LOW after entering READ
+reg read_skip;     // skip the first HIGH sample
+
+    shifter: holds the byte we’re transmitting (addr+R/W or write data).
+
+    rd_shift: accumulates bits we read from the slave.
+
+    bitcnt: counts down bits (7..0).
+
+    sent_addr: address phase complete?
+
+    reading: in the read data phase?
+
+    read_primed/read_skip: tiny timing guards to align the very first read bit with the TB slave (see below).
+
+Combinational “drive policy” (what we drive on pins per state)
+
+always @* begin
+  sda_oe = 1'b0; scl_oe = 1'b0;
+  case (state)
+    ST_IDLE:     ;
+
+Default: release both lines.
+
+    ST_START_HI: sda_oe = 1'b1;                          // START: SDA low while SCL high
+
+Drive SDA low (SCL left released → high). That creates a legal START.
+
+    ST_SEND:     begin scl_oe=(phase==1'b0); sda_oe = reading ? 1'b0 : ~shifter[7]; end
+
+During bit transfers:
+
+    SCL: low when phase==0, high when phase==1.
+
+    If reading, master releases SDA (slave drives).
+
+    If writing, master drives SDA with the current MSB: ~shifter[7] (0→drive low; 1→release).
+
+    ST_ACK:      begin scl_oe=(phase==1'b0); sda_oe = 1'b0; end // release for ACK/NACK
+
+9th bit: master always releases SDA so the slave can ACK, or (after a read) so the master can NACK by just keeping it released.
+
+    ST_STOP_LO:  begin scl_oe=(phase==1'b0); sda_oe = 1'b1; end
+
+Prepare STOP: ensure a low half with SDA low.
+
+    ST_STOP_HI:  begin scl_oe=(phase==1'b0); sda_oe = (phase==1'b1)?1'b0:1'b1; end
+
+When SCL is high (phase==1), release SDA → SDA rises while SCL high = legal STOP.
+
+    default:     ;
+  endcase
+end
+
+Main sequential FSM (control and shifting)
+
+always @(posedge clk or negedge rst_n) begin
+  if (!rst_n) begin
+
+Reset everything:
+
+    state<=ST_IDLE; busy<=1'b0; ack_error<=1'b0; rd_valid<=1'b0; rd_data<=8'h00;
+    shifter<=8'h00; rd_shift<=8'h00; bitcnt<=4'd0; sent_addr<=1'b0;
+    reading<=1'b0; read_primed<=1'b0; read_skip<=1'b0; phase_en<=1'b0; phase<=1'b1;
+
+  end else begin
+    rd_valid <= 1'b0;
+
+Default: de-assert rd_valid (we’ll pulse it for one cycle when a read byte finishes).
+IDLE
+
+    case (state)
+      ST_IDLE: begin
+        busy<=1'b0; phase_en<=1'b0; phase<=1'b1; reading<=1'b0; read_primed<=1'b0; read_skip<=1'b0;
+        if (start && wr_valid) begin
+          shifter <= {addr7, rw}; bitcnt<=4'd7; sent_addr<=1'b0; ack_error<=1'b0;
+          busy<=1'b1; state<=ST_START_HI;
+        end
+      end
+
+    Hold bus released (SCL high).
+
+    Wait for start && wr_valid.
+
+    Load the first byte to send: {addr7, rw} (MSB is address bit6; LSB is R/W).
+
+    Set busy, go create START.
+
+START (one half-period to set up)
+
+      ST_START_HI: if (tick) begin phase_en<=1'b1; phase<=1'b0; state<=ST_SEND; end
+
+At the next half-period tick:
+
+    Enable SCL toggling,
+
+    Start with phase=0 (SCL low first),
+
+    Move to send/receive state.
+
+SEND (write path or read path)
+
+      ST_SEND: begin
+        if (!reading) begin
+          // transmit: advance at end of HIGH
+          if (tick && phase==1'b1) begin
+            if (bitcnt==0) state<=ST_ACK;
+            else begin shifter<={shifter[6:0],1'b0}; bitcnt<=bitcnt-1'b1; end
+          end
+
+Write/Address TX path:
+
+    Only advance at the safe I²C sampling point (end of SCL-high).
+
+    If 8 bits done → go to ACK slot.
+
+    Else shift left (drop MSB we just sent), decrement bitcnt.
+
+        end else begin
+          // READ: wait a LOW, then skip first HIGH, then sample on HIGHs
+          if (tick && phase==1'b0) read_primed <= 1'b1;         // saw a LOW
+          if (tick && phase==1'b1 && read_primed) begin
+            if (read_skip) begin
+              // ignore this first HIGH to avoid race with TB's first fall drive
+              read_skip <= 1'b0;
+            end else begin
+              rd_shift <= {rd_shift[6:0], sda_in};              // shift-left, bring sampled bit into LSB
+              if (bitcnt==0) state<=ST_ACK; else bitcnt<=bitcnt-1'b1;
+            end
+          end
+        end
+      end
+
+Read RX path (subtle but important):
+
+    After address ACK, the slave starts driving the first data bit (MSB) while SCL is low.
+
+    To align perfectly:
+
+        Wait until we’ve seen one LOW half (read_primed).
+
+        Then skip the very first HIGH (read_skip) to avoid sampling too early.
+
+        From the next HIGH onwards, on each HIGH end, sample SDA and do:
+
+            rd_shift <= {rd_shift[6:0], sda_in} → MSB-first stream goes into our register left-shifted; the bit we sample drops into the LSB. After 8 samples, the byte is in correct order.
+
+ACK slot (9th bit)
+
+      ST_ACK: if (tick && phase==1'b1) begin
+        if (!sent_addr) begin
+          if (sda_in) ack_error<=1'b1;       // NACK on address
+          sent_addr<=1'b1;
+          if (rw==1'b0) begin
+            shifter<=wr_data; bitcnt<=4'd7; reading<=1'b0; read_primed<=1'b0; read_skip<=1'b0; state<=ST_SEND;
+          end else begin
+            rd_shift<=8'h00; bitcnt<=4'd7; reading<=1'b1; read_primed<=1'b0; read_skip<=1'b1; state<=ST_SEND;
+          end
+
+At the end of the ACK HIGH:
+
+    If we just finished the address byte:
+
+        If SDA is high → NACK (set ack_error).
+
+        Mark sent_addr=1.
+
+        If write: load wr_data, set up to send 8 bits.
+
+        If read: clear rd_shift, set reading=1, and set read_skip=1 (so we ignore the first HIGH as explained).
+
+        end else begin
+          if (rw==1'b0) begin
+            if (sda_in) ack_error<=1'b1;     // NACK on data
+            state<=ST_STOP_LO;
+          end else begin
+            rd_data<=rd_shift; rd_valid<=1'b1; state<=ST_STOP_LO;
+          end
+        end
+      end
+
+Otherwise, we just finished the data byte:
+
+    If write: check data ACK; then go to STOP.
+
+    If read: master NACKs the byte (we’re released here), present rd_data, pulse rd_valid, then go to STOP.
+
+STOP
+
+      ST_STOP_LO: if (phase==1'b1) state<=ST_STOP_HI;
+      ST_STOP_HI: if (tick) begin state<=ST_IDLE; phase_en<=1'b0; end
+      default: state<=ST_IDLE;
+    endcase
+  end
+end
+endmodule
+
+    Wait until SCL is high phase, then release SDA to make a STOP.
+
+    After one tick, return to IDLE and stop toggling SCL.
+
+Why the “read_primed/read_skip” bits matter
+
+    I²C rule: SDA may only change when SCL is low.
+    Your testbench slave puts the first MSB on SDA during the first low half of the read phase.
+
+    If the master samples immediately on the next high, depending on exact alignment, it can sample before the slave has fully driven that first bit.
+
+    The fix:
+
+        read_primed: don’t start sampling until we have seen at least one low half in the read phase.
+
+        read_skip: intentionally ignore the very first high sample once primed; start sampling from the second high. That guarantees the MSB is stable.
+
+Quick mental timeline (READ)
+
+    START → address+R → slave ACKs (SDA low on 9th).
+
+    Enter read phase:
+
+        phase toggles low → slave drives MSB.
+
+        First high → we skip sampling (safety).
+
+        Next low → slave prepares next bit.
+
+        Next high → we sample (bit0 of our shift reg gets MSB), shift left each time.
+
+    After 8 sampled highs → rd_shift holds the byte, rd_valid pulses, then STOP.
+
+That’s everything, line by line. If you want, I can also drop these explanations as comments directly inside your .v file so it’s self-documented.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/ tb_i2c_master_rw_min.v
+`timescale 1ns/1ps
+
+    Comment with filename (just for humans).
+
+    timescale 1ns/1ps tells the simulator that:
+
+        1 “time unit” = 1 nanosecond
+
+        timestamp rounding/precision = 1 picosecond
+
+module tb_i2c_master_rw_min;
+
+    Start of the testbench module. Testbenches are top-level—no ports.
+
+Clock and reset
+
+  reg clk = 0; always #5 clk = ~clk;   // 100 MHz
+
+    Create a clock that flips every 5 ns → period 10 ns → 100 MHz.
+
+  reg rst_n = 0;
+
+    Active-low reset for the DUT (0 = in reset, 1 = run).
+
+I²C bus wires and pull-ups (open-drain realism)
+
+  wire sda, scl;
+  pullup(sda);
+  pullup(scl);
+
+    The I²C bus uses open-drain lines. Devices only pull a line low or release it.
+
+    External resistors pull the lines up to ‘1’ when nobody drives them.
+
+    pullup(...) models those resistors in simulation:
+
+        If no one drives SDA/SCL → they read as 1.
+
+        If someone drives ‘0’ → it becomes 0.
+
+Control and status signals for the DUT
+
+  reg        start    = 0;
+  reg        rw       = 0;            // 0=write, 1=read
+  reg [6:0]  addr7    = 7'h48;
+  reg [7:0]  wr_data  = 8'hA5;
+  reg        wr_valid = 0;
+  wire       busy, ack_error;
+  wire [7:0] rd_data;
+  wire       rd_valid;
+
+    Inputs you’ll drive into the master:
+
+        start: one-clock pulse to begin a transaction.
+
+        rw: direction (0 = write, 1 = read).
+
+        addr7: 7-bit I²C address (here 0x48).
+
+        wr_data: byte to send on a write (here 0xA5).
+
+        wr_valid: must be 1 in the same cycle as start (design requirement).
+
+    Outputs from the master you’ll watch:
+
+        busy: 1 while transfer is active.
+
+        ack_error: 1 if a NACK happened.
+
+        rd_data: read byte value.
+
+        rd_valid: 1-cycle pulse when rd_data is ready.
+
+Instantiate the DUT (your I²C master)
+
+  i2c_master_rw #(
+    .CLK_FREQ_HZ(100_000_000),
+    .I2C_FREQ_HZ(100_000)
+  ) dut (
+    .clk(clk), .rst_n(rst_n),
+    .start(start), .rw(rw),
+    .addr7(addr7), .wr_data(wr_data), .wr_valid(wr_valid),
+    .busy(busy), .ack_error(ack_error),
+    .rd_data(rd_data), .rd_valid(rd_valid),
+    .sda(sda), .scl(scl)
+  );
+
+    Instantiates the design under test as dut.
+
+    Configures it for 100 MHz system clock and 100 kHz I²C.
+
+    Connects all the ports, including the same sda/scl wires with pull-ups.
+
+Tiny slave model: “ACKs everything, returns 0x3C on reads”
+
+  // --- tiny slave: ACKs & returns 0x3C on READ ---
+  localparam [7:0] SLAVE_RD_VALUE = 8'h3C;
+
+    Constant: this is the read byte the slave will output to the master.
+
+  reg slave_pull_low = 1'b0;          // 1=pull SDA low, 0=release
+  assign sda = slave_pull_low ? 1'b0 : 1'bz;
+
+    Single open-drain driver for the slave:
+
+        slave_pull_low=1 → pull SDA down to 0.
+
+        slave_pull_low=0 → release SDA (so pull-up makes it 1).
+
+    No one ever drives a ‘1’ on open-drain; we either pull low or let it float high.
+
+SCL edge detection helper
+
+  reg scl_q = 1'b1;
+  always @(posedge clk) scl_q <= scl;
+  wire scl_rise = (scl_q==1'b0 && scl==1'b1);
+  wire scl_fall = (scl_q==1'b1 && scl==1'b0);
+
+    scl_q = delayed version of SCL (sampled on system clock).
+
+    scl_rise: true for one system-clock cycle when SCL goes 0→1.
+
+    scl_fall: true when SCL goes 1→0.
+
+    We’ll use these to time ACKs and when to place read bits.
+
+Simple state for the slave
+
+  integer rise_cnt = 0;
+  reg     in_read  = 1'b0;
+  reg [2:0] bitpos = 3'd0;
+  reg [7:0] rd_pat = SLAVE_RD_VALUE;
+
+    rise_cnt: counts SCL rising edges within one master transaction (helps locate the 9th/18th ACK slots).
+
+    in_read: we’re in the read data phase after the address ACK (when master requested read).
+
+    bitpos: counts read bits from 0 to 8 (9th is the ACK/NACK slot).
+
+    rd_pat: shift register with the byte we’ll serve to the master (MSB first).
+
+Slave behavior (always block)
+
+  always @(posedge clk) begin
+    if (!rst_n || !busy) begin
+      slave_pull_low <= 1'b0;
+      rise_cnt       <= 0;
+      in_read        <= 1'b0;
+      bitpos         <= 3'd0;
+      rd_pat         <= SLAVE_RD_VALUE;
+
+    On reset or when the master is idle:
+
+        Release SDA,
+
+        Reset counters and flags,
+
+        Reload the read pattern 0x3C.
+
+    end else begin
+      if (scl_rise) begin
+        rise_cnt <= rise_cnt + 1;
+
+    During an active transfer, every SCL rising edge increments rise_cnt.
+
+        if (rise_cnt==8) slave_pull_low <= 1'b1;        // ACK address (9th high)
+
+    The 9th rising edge (counting from 0) is the ACK slot for the address byte.
+    Pull SDA low to ACK.
+
+        if (rise_cnt==9) begin
+          slave_pull_low <= 1'b0;                       // release after ACK
+          in_read        <= (rw==1'b1);
+          bitpos         <= 0;
+          rd_pat         <= SLAVE_RD_VALUE;
+        end
+
+    On the next rising edge, release SDA again.
+
+    If the master requested read (rw==1), set in_read=1.
+
+    Reset bitpos and reload rd_pat (prepare to send bits).
+
+        if (!in_read) begin
+          if (rise_cnt==17) slave_pull_low <= 1'b1;     // ACK write data (18th high)
+          if (rise_cnt==18) slave_pull_low <= 1'b0;
+
+    If this transaction is a write:
+
+        The 18th rising edge is the ACK slot for the data byte.
+        Pull low to ACK, then release on the next edge.
+
+        end else begin
+          if (bitpos<4'd8) bitpos <= bitpos + 1'b1;
+          else begin
+            // 9th (ACK/NACK) rising: master NACKs; we release
+            slave_pull_low <= 1'b0;
+            in_read        <= 1'b0;
+          end
+        end
+      end
+
+    If this transaction is a read:
+
+        Count 8 data bits on successive rising edges (0..7).
+
+        On the next rising edge (bitpos==8 → the 9th slot), master is supposed to NACK to end the single-byte read.
+        We make sure we release SDA for that slot and clear in_read.
+
+      // READ: drive next bit only when SCL is LOW (spec-correct)
+      if (in_read && scl_fall && bitpos<4'd8) begin
+        slave_pull_low <= (rd_pat[7]==1'b0);            // 0→pull, 1→release
+        rd_pat         <= {rd_pat[6:0],1'b0};           // MSB-first pattern
+      end
+
+    Critical I²C rule: SDA may only change while SCL is LOW.
+
+    So, on each falling edge of SCL during read:
+
+        Put the next bit of rd_pat onto SDA:
+
+            If that bit is 0 → pull low,
+
+            If that bit is 1 → release (line goes high via pull-up).
+
+        Shift rd_pat left so the next MSB is ready for the next bit.
+
+    end
+  end
+
+    End of the slave behavior block.
+
+A small timeout counter (to avoid infinite waits)
+
+  integer to_cnt;
+
+    Simple integer used in “while with timeout” loops below.
+
+The actual test sequence
+
+  initial begin
+    $display("==== SIMPLE I2C TEST START ====");
+
+    Print a header in the simulation console.
+
+    repeat (10) @(posedge clk); rst_n = 1;
+
+    Hold reset low for 10 clock cycles, then release it (rst_n=1).
+
+    repeat (20) @(posedge clk);
+
+    Wait 20 more cycles to let things settle (not strictly required, but nice).
+
+WRITE phase
+
+    // WRITE
+    rw       = 1'b0;
+    wr_valid = 1'b1;
+    start    = 1'b1; @(posedge clk); start = 1'b0;
+
+    Set write direction.
+
+    Set wr_valid=1 (required by the DUT).
+
+    Pulse start for exactly 1 system clock.
+
+    to_cnt=0; while (!busy && to_cnt<100000) begin @(posedge clk); to_cnt=to_cnt+1; end
+
+    Wait until the DUT raises busy (transaction started), but don’t wait forever—bail out if we waited too long.
+
+    to_cnt=0; while ( busy && to_cnt<100000) begin @(posedge clk); to_cnt=to_cnt+1; end
+
+    Then wait until busy drops (transaction finished), again with a timeout.
+
+    if (ack_error) $display("WRITE: NACK error!");
+    else           $display("WRITE: OK  (addr=0x%02h data=0x%02h)", addr7, wr_data);
+
+    Report whether write succeeded (no NACKs).
+
+READ phase
+
+    // READ
+    rw       = 1'b1;
+    wr_valid = 1'b1;                 // MUST be 1 with start
+    start    = 1'b1; @(posedge clk); start = 1'b0;
+
+    Set read direction and again ensure wr_valid=1 with start (DUT’s rule).
+
+    Pulse start one clock.
+
+    to_cnt=0; while (!busy && to_cnt<100000)  begin @(posedge clk); to_cnt=to_cnt+1; end
+
+    Wait for busy to go high (read started), with timeout protection.
+
+    to_cnt=0; while (!rd_valid && to_cnt<200000) begin @(posedge clk); to_cnt=to_cnt+1; end
+
+    Wait until the DUT asserts rd_valid (the read byte is captured and ready), also with a timeout.
+
+    if (rd_valid)
+      $display("READ : got 0x%02h (expected 0x%02h)", rd_data, SLAVE_RD_VALUE);
+    else
+      $display("READ : TIMEOUT waiting for rd_valid!");
+
+    If we saw rd_valid, print the value we got and what we expected (0x3C).
+
+    If not, complain that we timed out.
+
+    to_cnt=0; while ( busy && to_cnt<100000) begin @(posedge clk); to_cnt=to_cnt+1; end
+
+    Finally, wait for the DUT to become idle again (finish the STOP condition).
+
+    $display("==== TEST DONE ====");
+    #200 $finish;
+  end
+
+    Print a footer and end the simulation 200 ns later (gives you a little tail to see clean STOP in the waves).
+
+endmodule
+
+    End of the testbench.
+
+What this TB guarantees (and why it’s “correct I²C”)
+
+    Open-drain behavior is modeled: pull low or release; never drive ‘1’.
+
+    SDA only changes when SCL is low (in the read phase we change SDA on scl_fall).
+
+    ACK timing is right: slave drives SDA low on the 9th bit of the address (and the write data), detected by rise_cnt on SCL rising edges.
+
+    The slave releases SDA during the 9th bit of the read byte so the master can NACK to end a single-byte read.
+
+    Timeouts prevent infinite loops if something goes wrong.
+
+Quick mental picture
+
+    Idle: SDA=1, SCL=1 (both pulled up).
+
+    Write:
+
+        START (SDA↓ while SCL=1)
+
+        Address+W (8 bits), ACK on 9th (slave pulls low)
+
+        Data (8 bits), ACK on 9th (slave pulls low)
+
+        STOP (SDA↑ while SCL=1)
+
+    Read:
+
+        START
+
+        Address+R, ACK on 9th
+
+        Slave puts 8 data bits on SDA (changes only while SCL=LOW)
+
+        Master samples each bit on SCL=HIGH and then NACKs the byte (keeps SDA released on 9th)
+
+        STOP
+
+If you want, I can also add inline comments directly inside the file so your submitted TB is self-documented.
+
+
+
+
