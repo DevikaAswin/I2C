@@ -1,0 +1,715 @@
+`timescale 1ps/1ps
+
+// =====================================================================================================================
+// This example design top module instantiates the example design wrapper; slices vectored ports for per-channel
+// assignment; and instantiates example resources such as buffers, pattern generators, and pattern checkers for core
+// demonstration purposes
+// =====================================================================================================================
+
+module arinc818_trans_top 
+(
+  input  wire mgtrefclk0_x0y2_int,
+  // Serial data ports for sfp0 kcu105 transceiver 
+  input  wire sfp_rx_n,
+  input  wire sfp_rx_p,
+  output wire sfp_tx_n,
+  output wire sfp_tx_p,
+  input  wire drp_clk25M,
+  input  wire drp_clk25M_rst,
+  output wire userclk_tx_usrclk2,
+  output wire userclk_rx_usrclk2,
+  input  wire [31:0] advb_txdata,
+  input  wire [3:0]  advb_txcharisk,  
+  output  wire [31:0] advb_rxdata,
+  output  wire [3:0]  advb_rxcharisk,
+  output  wire [0:0]  reset_rx_done_out,   
+  output wire [0:0] cplllock_out,
+  output wire [0:0] txpmaresetdone_out,
+  output wire [0:0] rxpmaresetdone_out
+);
+
+  wire [0:0] gtpowergood_out;
+  wire [0 : 0] rxbyteisaligned_out;
+  wire [0 : 0] rxbyterealign_out;
+  wire [0 : 0] rxcommadet_out; 
+  //--------------------------------------------------------------------------------------------------------------------
+  // The TX user clocking helper block should be held in reset until the clock source of that block is known to be
+  // stable. The following assignment is an example of how that stability can be determined, based on the selected TX
+  // user clock source. Replace the assignment with the appropriate signal or logic to achieve that behavior as needed.
+  wire [0:0] userclk_tx_reset_in;
+  
+  assign userclk_tx_reset_in[0:0] = ~(&txpmaresetdone_out);
+  //--------------------------------------------------------------------------------------------------------------------
+  wire [0:0] userclk_tx_srcclk_out;
+  wire [0:0] userclk_tx_usrclk_out;
+  wire [0:0] userclk_tx_active_out;  
+  //--------------------------------------------------------------------------------------------------------------------
+  // The RX user clocking helper block should be held in reset until the clock source of that block is known to be
+  // stable. The following assignment is an example of how that stability can be determined, based on the selected RX
+  // user clock source. Replace the assignment with the appropriate signal or logic to achieve that behavior as needed.
+  wire [0:0] userclk_rx_reset_in;
+  
+  assign userclk_rx_reset_in = ~(&rxpmaresetdone_out);
+  //--------------------------------------------------------------------------------------------------------------------
+  wire [0:0] userclk_rx_srcclk_out;
+  wire [0:0] userclk_rx_usrclk_out;
+  wire [0:0] userclk_rx_active_out;  
+  //--------------------------------------------------------------------------------------------------------------------
+  wire [0:0]  reset_tx_pll_and_datapath_in;
+  wire [0:0]  reset_tx_datapath_in;
+  wire [0:0]  reset_rx_pll_and_datapath_in;
+  wire [0:0]  reset_rx_datapath_in;
+  wire [0:0]  reset_rx_cdr_stable_out;
+  wire [0:0]  reset_tx_done_out;
+  
+  
+  assign reset_tx_pll_and_datapath_in = 1'b0;
+  assign reset_rx_pll_and_datapath_in = 1'b0;
+  assign reset_tx_datapath_in         = 1'b0;
+  //--------------------------------------------------------------------------------------------------------------------
+  wire [8:0]  drpaddr_in;
+  wire [15:0] drpdi_in;
+  wire [0:0]  drpen_in; 
+  wire [0:0]  drpwe_in; 
+  wire [15:0] drpdo_out;  
+  wire [0:0]  drprdy_out;  
+  
+  assign drpaddr_in = 9'b000000000;
+  assign drpdi_in   = 16'b0000000000000000;
+  assign drpen_in   = 1'b0;
+  assign drpwe_in   = 1'b0;
+  //--------------------------------------------------------------------------------------------------------------------
+  wire [2:0] loopback;
+  wire [0:0] rx8b10ben_in;
+  wire [0:0] tx8b10ben_in;
+  
+  assign loopback      = 3'b000; 
+  assign rx8b10ben_in  = 1'b1;
+  assign tx8b10ben_in  = 1'b1;
+  //--------------------------------------------------------------------------------------------------------------------
+  wire [15:0] txctrl0_in;
+  wire [15:0] txctrl1_in;
+  wire [7:0]  txctrl2_in;
+ 
+  assign txctrl0_in          = 16'b0;
+  assign txctrl1_in          = 16'b0;
+  assign txctrl2_in          = {4'b0, advb_txcharisk};
+  //--------------------------------------------------------------------------------------------------------------------
+  
+  wire [2:0] rxbufstatus_out;
+  wire [15:0] rxctrl0_out;
+  wire [15:0] rxctrl1_out;
+  wire [7:0] rxctrl2_out;
+  wire [7:0] rxctrl3_out;
+  wire [1:0] txbufstatus_out;
+  wire [0:0] rxsyncdone_out;
+  
+  assign advb_rxcharisk = rxctrl0_out[3:0];
+
+  // Buffer the reset_in input and logically combine it with the internal signal from the example
+  // initialization block as well as the VIO-sourced reset
+  //wire reset_all_vio_in;
+  wire reset_all_buf_in;
+  wire reset_all_init_in;
+  wire reset_all_in;
+
+  IBUF ibuf_reset_all_inst (
+    .I (!drp_clk25M_rst),
+    .O (reset_all_buf_in)
+  );
+
+  assign reset_all_in = reset_all_buf_in || reset_all_init_in;// || reset_all_vio_in;
+  
+  // The example initialization module interacts with the reset controller helper block and other example design logic
+  // to retry failed reset attempts in order to mitigate bring-up issues such as initially-unavilable reference clocks
+  // or data connections. It also resets the receiver in the event of link loss in an attempt to regain link, so please
+  // note the possibility that this behavior can have the effect of overriding or disturbing user-provided inputs that
+  // destabilize the data stream. It is a demonstration only and can be modified to suit your system needs.
+  arinc818_trans_init gth_init_inst (
+    .clk_freerun_in  (drp_clk25M),
+    .reset_all_in    (reset_all_in),
+    .tx_init_done_in (reset_tx_done_out),
+    .rx_init_done_in (reset_rx_done_out),
+    .rx_data_good_in (sm_link),
+    .reset_all_out   (reset_all_init_in),
+    .reset_rx_out    (reset_rx_datapath_in),
+    .init_done_out   (init_done_in),
+    .retry_ctr_out   (init_retry_ctr_in)
+  );  
+
+  // Instantiate the example design wrapper, mapping its enabled ports to per-channel internal signals and example
+  // resources as appropriate
+  arinc818_trans_wrapper wrapper_inst (
+    .gthrxn_in                               (sfp_rx_n)
+   ,.gthrxp_in                               (sfp_rx_p)
+   ,.gthtxn_out                              (sfp_tx_n)
+   ,.gthtxp_out                              (sfp_tx_p)
+   ,.gtwiz_userclk_tx_reset_in               (userclk_tx_reset_in)
+   ,.gtwiz_userclk_tx_srcclk_out             (userclk_tx_srcclk_out)
+   ,.gtwiz_userclk_tx_usrclk_out             (userclk_tx_usrclk_out)
+   ,.gtwiz_userclk_tx_usrclk2_out            (userclk_tx_usrclk2)
+   ,.gtwiz_userclk_tx_active_out             (userclk_tx_active_out)
+   ,.gtwiz_userclk_rx_reset_in               (userclk_rx_reset_in)
+   ,.gtwiz_userclk_rx_srcclk_out             (userclk_rx_srcclk_out)
+   ,.gtwiz_userclk_rx_usrclk_out             (userclk_rx_usrclk_out)
+   ,.gtwiz_userclk_rx_usrclk2_out            (userclk_rx_usrclk2)
+   ,.gtwiz_userclk_rx_active_out             (userclk_rx_active_out)
+   ,.gtwiz_reset_clk_freerun_in              (drp_clk25M)
+   ,.gtwiz_reset_all_in                      (reset_all_in)
+   ,.gtwiz_reset_tx_pll_and_datapath_in      (reset_tx_pll_and_datapath_in)
+   ,.gtwiz_reset_tx_datapath_in              (reset_tx_datapath_in)
+   ,.gtwiz_reset_rx_pll_and_datapath_in      (reset_rx_pll_and_datapath_in)
+   ,.gtwiz_reset_rx_datapath_in              (reset_rx_datapath_in)
+   ,.gtwiz_reset_rx_cdr_stable_out           (reset_rx_cdr_stable_out)
+   ,.gtwiz_reset_tx_done_out                 (reset_tx_done_out)
+   ,.gtwiz_reset_rx_done_out                 (reset_rx_done_out)
+   ,.gtwiz_userdata_tx_in                    (advb_txdata)
+   ,.gtwiz_userdata_rx_out                   (advb_rxdata)
+   ,.drpaddr_in                              (drpaddr_in)
+   ,.drpclk_in                               (drp_clk25M)
+   ,.drpdi_in                                (drpdi_in)
+   ,.drpen_in                                (drpen_in)
+   ,.drpwe_in                                (drpwe_in)
+   ,.gtrefclk0_in                            (mgtrefclk0_x0y2_int)
+   ,.loopback_in                             (loopback)
+   ,.rx8b10ben_in                            (rx8b10ben_in)
+   ,.tx8b10ben_in                            (tx8b10ben_in)
+   ,.txctrl0_in                              (txctrl0_in)
+   ,.txctrl1_in                              (txctrl1_in)
+   ,.txctrl2_in                              (txctrl2_in)
+   ,.cplllock_out                            (cplllock_out)
+   ,.drpdo_out                               (drpdo_out)
+   ,.drprdy_out                              (drprdy_out)
+   ,.gtpowergood_out                         (gtpowergood_out)
+   ,.rxbufstatus_out                         (rxbufstatus_out)
+   ,.rxctrl0_out                             (rxctrl0_out)
+   ,.rxctrl1_out                             (rxctrl1_out)
+   ,.rxctrl2_out                             (rxctrl2_out)
+   ,.rxctrl3_out                             (rxctrl3_out)
+   ,.rxpmaresetdone_out                      (rxpmaresetdone_out)
+   ,.rxsyncdone_out                          (rxsyncdone_out)
+   ,.txbufstatus_out                         (txbufstatus_out)
+   ,.rxbyteisaligned_out                     (rxbyteisaligned_out)
+   ,.rxbyterealign_out                       (rxbyterealign_out)
+   ,.rxcommadet_out                          (rxcommadet_out)   
+   ,.txpmaresetdone_out                      (txpmaresetdone_out)
+);
+
+
+endmodule
+module arinc818_trans_init # (
+
+  parameter real   P_FREERUN_FREQUENCY    = 25,
+  parameter real   P_TX_TIMER_DURATION_US = 30000,
+  parameter real   P_RX_TIMER_DURATION_US = 130000
+
+)(
+
+  input  wire      clk_freerun_in,
+  input  wire      reset_all_in,
+  input  wire      tx_init_done_in,
+  input  wire      rx_init_done_in,
+  input  wire      rx_data_good_in,
+  output reg       reset_all_out = 1'b0,
+  output reg       reset_rx_out  = 1'b0,
+  output reg       init_done_out = 1'b0,
+  output reg [3:0] retry_ctr_out = 4'd0
+
+);
+
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Synchronizers
+  // -------------------------------------------------------------------------------------------------------------------
+
+  // Synchronize the "reset all" input signal into the free-running clock domain
+  // The reset_all_in input should be driven by the master "reset all" example design input
+  wire reset_all_sync;
+  (* DONT_TOUCH = "TRUE" *)
+  reset_synchronizer reset_synchronizer_reset_all_inst (
+    .clk_in  (clk_freerun_in),
+    .rst_in  (reset_all_in),
+    .rst_out (reset_all_sync)
+  );
+
+  // Synchronize the TX initialization done indicator into the free-running clock domain
+  // The tx_init_done_in input should be driven by the signal or logical combination of signals that represents a
+  // completed TX initialization process; for example, the reset helper block gtwiz_reset_tx_done_out signal, or the
+  // logical AND of gtwiz_reset_tx_done_out with gtwiz_buffbypass_tx_done_out if the TX buffer is bypassed.
+  wire tx_init_done_sync;
+  (* DONT_TOUCH = "TRUE" *)
+  bit_synchronizer bit_synchronizer_tx_init_done_inst (
+    .clk_in (clk_freerun_in),
+    .i_in   (tx_init_done_in),
+    .o_out  (tx_init_done_sync)
+  );
+
+  // Synchronize the RX initialization done indicator into the free-running clock domain
+  // The rx_init_done_in input should be driven by the signal or logical combination of signals that represents a
+  // completed RX initialization process; for example, the reset helper block gtwiz_reset_rx_done_out signal, or the
+  // logical AND of gtwiz_reset_rx_done_out with gtwiz_buffbypass_rx_done_out if the RX elastic buffer is bypassed.
+  wire rx_init_done_sync;
+  (* DONT_TOUCH = "TRUE" *)
+  bit_synchronizer bit_synchronizer_rx_init_done_inst (
+    .clk_in (clk_freerun_in),
+    .i_in   (rx_init_done_in),
+    .o_out  (rx_init_done_sync)
+  );
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Timer
+  // -------------------------------------------------------------------------------------------------------------------
+
+  // Declare registers and local parameters used for the shared TX and RX initialization timer
+  // The free-running clock frequency is specified by the P_FREERUN_FREQUENCY parameter. The TX initialization timer
+  // duration is specified by the P_TX_TIMER_DURATION_US parameter (default 30,000us), and the resulting terminal count
+  // is assigned to p_tx_timer_term_cyc_int. The RX initialization timer duration is specified by the
+  // P_RX_TIMER_DURATION_US parameter (default 130,000us), and the resulting terminal count is assigned to
+  // p_rx_timer_term_cyc_int.
+  reg         timer_clr = 1'b1;
+  reg  [24:0] timer_ctr = 25'd0;
+  reg         tx_timer_sat = 1'b0;
+  reg         rx_timer_sat = 1'b0;
+  wire [24:0] p_tx_timer_term_cyc_int = P_TX_TIMER_DURATION_US * P_FREERUN_FREQUENCY;
+  wire [24:0] p_rx_timer_term_cyc_int = P_RX_TIMER_DURATION_US * P_FREERUN_FREQUENCY;
+
+  // When the timer is enabled by the initialization state machine, increment the timer_ctr counter until its value
+  // reaches p_rx_timer_term_cyc_int RX terminal count and rx_timer_sat is asserted. Assert tx_timer_sat when the
+  // counter value reaches the p_tx_timer_term_cyc_int TX terminal count. Clear the timer and remove assertions when the
+  // timer is disabled by the initialization state machine.
+  always @(posedge clk_freerun_in) begin
+    if (timer_clr) begin
+      timer_ctr    <= 25'd0;
+      tx_timer_sat <= 1'b0;
+      rx_timer_sat <= 1'b0;
+    end
+    else begin
+      if (timer_ctr == p_tx_timer_term_cyc_int)
+        tx_timer_sat <= 1'b1;
+
+      if (timer_ctr == p_rx_timer_term_cyc_int)
+        rx_timer_sat <= 1'b1;
+      else
+        timer_ctr <= timer_ctr + 25'd1;
+    end
+  end
+
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Retry counter
+  // -------------------------------------------------------------------------------------------------------------------
+
+  // Increment the retry_ctr_out register for each TX or RX reset asserted by the initialization state machine until the
+  // register saturates at 4'd15. This value, which is initialized on device programming and is never reset, could be
+  // useful for debugging purposes. The initialization state machine will continue to retry as needed beyond the retry
+  // register saturation point indicated, so 4'd15 should be interpreted as "15 or more attempts since programming."
+  reg retry_ctr_incr = 1'b0;
+
+  always @(posedge clk_freerun_in) begin
+    if ((retry_ctr_incr == 1'b1) && (retry_ctr_out != 4'd15))
+      retry_ctr_out <= retry_ctr_out + 4'd1;
+  end
+
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Initialization state machine
+  // -------------------------------------------------------------------------------------------------------------------
+
+  // Declare local parameters and state register for the initialization state machine
+  localparam [1:0] ST_START       = 2'd0;
+  localparam [1:0] ST_TX_WAIT     = 2'd1;
+  localparam [1:0] ST_RX_WAIT     = 2'd2;
+  localparam [1:0] ST_MONITOR     = 2'd3;
+  reg        [1:0] sm_init        = ST_START;
+  reg              sm_init_active = 1'b0;
+
+  // Implement the initialization state machine control and its outputs as a single sequential process. The state
+  // machine is reset by the synchronized reset_all_in input, and does not begin operating until its first use. Note
+  // that this state machine is designed to interact with and enhance the reset controller helper block.
+  always @(posedge clk_freerun_in) begin
+    if (reset_all_sync) begin
+      timer_clr      <= 1'b1;
+      reset_all_out  <= 1'b0;
+      reset_rx_out   <= 1'b0;
+      retry_ctr_incr <= 1'b0;
+      init_done_out  <= 1'b0;
+      sm_init_active <= 1'b1;
+      sm_init        <= ST_START;
+    end
+    else begin
+      case (sm_init)
+
+        // When starting the initialization procedure, clear the timer and remove reset outputs, then proceed to wait
+        // for completion of TX initialization
+        ST_START: begin
+          if (sm_init_active) begin
+            timer_clr      <= 1'b1;
+            reset_all_out  <= 1'b0;
+            reset_rx_out   <= 1'b0;
+            retry_ctr_incr <= 1'b0;
+            sm_init        <= ST_TX_WAIT;
+          end
+        end
+
+        // Enable the timer. If TX initialization completes before the counter's TX terminal count, clear the timer and
+        // proceed to wait for RX initialization. If the TX terminal count is reached, clear the timer, assert the
+        // reset_all_out output (which in this example causes a master reset_all assertion), and increment the retry
+        // counter. Completion conditions for TX initialization are described above.
+        ST_TX_WAIT: begin
+          if (tx_init_done_sync) begin
+            timer_clr <= 1'b1;
+            sm_init   <= ST_RX_WAIT;
+          end
+          else begin
+            if (tx_timer_sat) begin
+              timer_clr      <= 1'b1;
+              reset_all_out  <= 1'b1;
+              retry_ctr_incr <= 1'b1;
+              sm_init        <= ST_START;
+            end
+            else begin
+              timer_clr <= 1'b0;
+            end
+          end
+        end
+
+        // Enable the timer. When the RX terminal count is reached, check whether RX initialization has completed and
+        // whether the data good indicator is high. If both conditions are met, transition to the MONITOR state. If
+        // either condition is not met, then clear the timer, assert the reset_rx_out output (which in this example
+        // either drives gtwiz_reset_rx_pll_and_datapath_in or gtwiz_reset_rx_datapath_in, depending on PLL sharing),
+        // and increnent the retry counter.
+        ST_RX_WAIT: begin
+          if (rx_timer_sat) begin
+            if (rx_init_done_sync) begin
+              init_done_out <= 1'b1;
+              sm_init       <= ST_MONITOR;
+            end
+            else begin
+              timer_clr      <= 1'b1;
+              reset_rx_out   <= 1'b1;
+              retry_ctr_incr <= 1'b1;
+              sm_init        <= ST_START;
+            end
+          end
+          else begin
+            timer_clr <= 1'b0;
+          end
+        end
+
+        // In this MONITOR state, assert the init_done_out output for use as desired. If RX initialization or the data
+        // good indicator is lost while in this state, reset the RX components as described in the ST_RX_WAIT state.
+        ST_MONITOR: begin
+          if (~rx_init_done_sync) begin
+            init_done_out  <= 1'b0;
+            timer_clr      <= 1'b1;
+            reset_rx_out   <= 1'b1;
+            retry_ctr_incr <= 1'b1;
+            sm_init        <= ST_START;
+          end
+        end
+
+      endcase
+    end
+  end
+
+
+endmodule
+
+
+
+
+module reset_synchronizer # (
+
+  parameter FREQUENCY = 512
+
+)(
+
+  input  wire clk_in,
+  input  wire rst_in,
+  output wire rst_out
+
+);
+
+  // Use 5 flip-flops as a single synchronizer, and tag each declaration with the appropriate synthesis attribute to
+  // enable clustering. Each flip-flop in the synchronizer is asynchronously reset so that the downstream logic is also
+  // asynchronously reset but encounters no reset assertion latency. The removal of reset is synchronous, so that the
+  // downstream logic is also removed from reset synchronously. This module is designed for active-high reset use.
+
+  (* ASYNC_REG = "TRUE" *) reg rst_in_meta  = 1'b0;
+  (* ASYNC_REG = "TRUE" *) reg rst_in_sync1 = 1'b0;
+  (* ASYNC_REG = "TRUE" *) reg rst_in_sync2 = 1'b0;
+  (* ASYNC_REG = "TRUE" *) reg rst_in_sync3 = 1'b0;
+                           reg rst_in_out   = 1'b0;
+
+  always @(posedge clk_in, posedge rst_in) begin
+    if (rst_in) begin
+      rst_in_meta  <= 1'b1;
+      rst_in_sync1 <= 1'b1;
+      rst_in_sync2 <= 1'b1;
+      rst_in_sync3 <= 1'b1;
+      rst_in_out   <= 1'b1;
+    end
+    else begin
+      rst_in_meta  <= 1'b0;
+      rst_in_sync1 <= rst_in_meta;
+      rst_in_sync2 <= rst_in_sync1;
+      rst_in_sync3 <= rst_in_sync2;
+      rst_in_out   <= rst_in_sync3;
+    end
+  end
+
+  assign rst_out = rst_in_out;
+
+
+endmodule
+
+
+
+module bit_synchronizer # (
+
+  parameter INITIALIZE = 5'b00000,
+  parameter FREQUENCY  = 512
+
+)(
+
+  input  wire clk_in,
+  input  wire i_in,
+  output wire o_out
+
+);
+
+  // Use 5 flip-flops as a single synchronizer, and tag each declaration with the appropriate synthesis attribute to
+  // enable clustering. Their GSR default values are provided by the INITIALIZE parameter.
+
+  (* ASYNC_REG = "TRUE" *) reg i_in_meta  = INITIALIZE[0];
+  (* ASYNC_REG = "TRUE" *) reg i_in_sync1 = INITIALIZE[1];
+  (* ASYNC_REG = "TRUE" *) reg i_in_sync2 = INITIALIZE[2];
+  (* ASYNC_REG = "TRUE" *) reg i_in_sync3 = INITIALIZE[3];
+                           reg i_in_out   = INITIALIZE[4];
+
+  always @(posedge clk_in) begin
+    i_in_meta  <= i_in;
+    i_in_sync1 <= i_in_meta;
+    i_in_sync2 <= i_in_sync1;
+    i_in_sync3 <= i_in_sync2;
+    i_in_out   <= i_in_sync3;
+  end
+
+  assign o_out = i_in_out;
+
+
+endmodule
+module bit_synchronizer # (
+
+  parameter INITIALIZE = 5'b00000,
+  parameter FREQUENCY  = 512
+
+)(
+
+  input  wire clk_in,
+  input  wire i_in,
+  output wire o_out
+
+);
+
+  // Use 5 flip-flops as a single synchronizer, and tag each declaration with the appropriate synthesis attribute to
+  // enable clustering. Their GSR default values are provided by the INITIALIZE parameter.
+
+  (* ASYNC_REG = "TRUE" *) reg i_in_meta  = INITIALIZE[0];
+  (* ASYNC_REG = "TRUE" *) reg i_in_sync1 = INITIALIZE[1];
+  (* ASYNC_REG = "TRUE" *) reg i_in_sync2 = INITIALIZE[2];
+  (* ASYNC_REG = "TRUE" *) reg i_in_sync3 = INITIALIZE[3];
+                           reg i_in_out   = INITIALIZE[4];
+
+  always @(posedge clk_in) begin
+    i_in_meta  <= i_in;
+    i_in_sync1 <= i_in_meta;
+    i_in_sync2 <= i_in_sync1;
+    i_in_sync3 <= i_in_sync2;
+    i_in_out   <= i_in_sync3;
+  end
+
+  assign o_out = i_in_out;
+
+
+endmodule
+
+
+module arinc818_trans_wrapper (
+  input  wire [0:0] gthrxn_in
+ ,input  wire [0:0] gthrxp_in
+ ,output wire [0:0] gthtxn_out
+ ,output wire [0:0] gthtxp_out
+ ,input  wire [0:0] gtwiz_userclk_tx_reset_in
+ ,output wire [0:0] gtwiz_userclk_tx_srcclk_out
+ ,output wire [0:0] gtwiz_userclk_tx_usrclk_out
+ ,output wire [0:0] gtwiz_userclk_tx_usrclk2_out
+ ,output wire [0:0] gtwiz_userclk_tx_active_out
+ ,input  wire [0:0] gtwiz_userclk_rx_reset_in
+ ,output wire [0:0] gtwiz_userclk_rx_srcclk_out
+ ,output wire [0:0] gtwiz_userclk_rx_usrclk_out
+ ,output wire [0:0] gtwiz_userclk_rx_usrclk2_out
+ ,output wire [0:0] gtwiz_userclk_rx_active_out
+ ,input  wire [0:0] gtwiz_reset_clk_freerun_in
+ ,input  wire [0:0] gtwiz_reset_all_in
+ ,input  wire [0:0] gtwiz_reset_tx_pll_and_datapath_in
+ ,input  wire [0:0] gtwiz_reset_tx_datapath_in
+ ,input  wire [0:0] gtwiz_reset_rx_pll_and_datapath_in
+ ,input  wire [0:0] gtwiz_reset_rx_datapath_in
+ ,output wire [0:0] gtwiz_reset_rx_cdr_stable_out
+ ,output wire [0:0] gtwiz_reset_tx_done_out
+ ,output wire [0:0] gtwiz_reset_rx_done_out
+ ,input  wire [31:0] gtwiz_userdata_tx_in
+ ,output wire [31:0] gtwiz_userdata_rx_out
+ ,input  wire [8:0] drpaddr_in
+ ,input  wire [0:0] drpclk_in
+ ,input  wire [15:0] drpdi_in
+ ,input  wire [0:0] drpen_in
+ ,input  wire [0:0] drpwe_in
+ ,input  wire [0:0] gtrefclk0_in
+ ,input  wire [2:0] loopback_in
+ ,input  wire [0:0] rx8b10ben_in
+ ,input  wire [0:0] tx8b10ben_in
+ ,input  wire [15:0] txctrl0_in
+ ,input  wire [15:0] txctrl1_in
+ ,input  wire [7:0] txctrl2_in
+ ,output wire [0:0] cplllock_out
+ ,output wire [15:0] drpdo_out
+ ,output wire [0:0] drprdy_out
+ ,output wire [0:0] gtpowergood_out
+ ,output wire [2:0] rxbufstatus_out
+ ,output wire [0:0] rxbyteisaligned_out
+ ,output wire [0:0] rxbyterealign_out
+ ,output wire [0:0] rxcommadet_out 
+ ,output wire [15:0] rxctrl0_out
+ ,output wire [15:0] rxctrl1_out
+ ,output wire [7:0] rxctrl2_out
+ ,output wire [7:0] rxctrl3_out
+ ,output wire [0:0] rxpmaresetdone_out
+ ,output wire [0:0] rxsyncdone_out
+ ,output wire [1:0] txbufstatus_out
+ ,output wire [0:0] txpmaresetdone_out
+);
+
+
+  // ===================================================================================================================
+  // PARAMETERS AND FUNCTIONS
+  // ===================================================================================================================
+
+  // Declare and initialize local parameters and functions used for HDL generation
+  localparam [191:0] P_CHANNEL_ENABLE = 192'b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001;
+  `include "arinc818_trans_example_wrapper_functions.v"
+  localparam integer P_TX_MASTER_CH_PACKED_IDX = f_calc_pk_mc_idx(0);
+  localparam integer P_RX_MASTER_CH_PACKED_IDX = f_calc_pk_mc_idx(0);
+
+
+  // ===================================================================================================================
+  // HELPER BLOCKS
+  // ===================================================================================================================
+
+  // Any helper blocks which the user chose to exclude from the core will appear below. In addition, some signal
+  // assignments related to optionally-enabled ports may appear below.
+
+
+
+
+  wire [0:0] rxsyncdone_int;
+
+  // Required assignment to expose the RXSYNCDONE port per user request
+  assign rxsyncdone_out = rxsyncdone_int;
+  wire [0:0] gtpowergood_int;
+
+  // Required assignment to expose the GTPOWERGOOD port per user request
+  assign gtpowergood_out = gtpowergood_int;
+  wire [0:0] cplllock_int;
+
+  // Required assignment to expose the CPLLLOCK port per user request
+  assign cplllock_out = cplllock_int;
+
+  // ----------------------------------------------------------------------------------------------------------------
+  // Assignments to expose data ports, or data control ports, per configuration requirement or user request
+  // ----------------------------------------------------------------------------------------------------------------
+
+  wire [15:0] txctrl0_int;
+
+  // Required assignment to expose the TXCTRL0 port per configuration requirement or user request
+  assign txctrl0_int = txctrl0_in;
+  wire [15:0] txctrl1_int;
+
+  // Required assignment to expose the TXCTRL1 port per configuration requirement or user request
+  assign txctrl1_int = txctrl1_in;
+  wire [15:0] rxctrl0_int;
+
+  // Required assignment to expose the RXCTRL0 port per configuration requirement or user request
+  assign rxctrl0_out = rxctrl0_int;
+  wire [15:0] rxctrl1_int;
+
+  // Required assignment to expose the RXCTRL1 port per configuration requirement or user request
+  assign rxctrl1_out = rxctrl1_int;
+
+
+  // ===================================================================================================================
+  // CORE INSTANCE
+  // ===================================================================================================================
+
+  // Instantiate the core, mapping its enabled ports to example design ports and helper blocks as appropriate
+  arinc818_trans arinc818_trans_inst (
+    .gthrxn_in                               (gthrxn_in)
+   ,.gthrxp_in                               (gthrxp_in)
+   ,.gthtxn_out                              (gthtxn_out)
+   ,.gthtxp_out                              (gthtxp_out)
+   ,.gtwiz_userclk_tx_reset_in               (gtwiz_userclk_tx_reset_in)
+   ,.gtwiz_userclk_tx_srcclk_out             (gtwiz_userclk_tx_srcclk_out)
+   ,.gtwiz_userclk_tx_usrclk_out             (gtwiz_userclk_tx_usrclk_out)
+   ,.gtwiz_userclk_tx_usrclk2_out            (gtwiz_userclk_tx_usrclk2_out)
+   ,.gtwiz_userclk_tx_active_out             (gtwiz_userclk_tx_active_out)
+   ,.gtwiz_userclk_rx_reset_in               (gtwiz_userclk_rx_reset_in)
+   ,.gtwiz_userclk_rx_srcclk_out             (gtwiz_userclk_rx_srcclk_out)
+   ,.gtwiz_userclk_rx_usrclk_out             (gtwiz_userclk_rx_usrclk_out)
+   ,.gtwiz_userclk_rx_usrclk2_out            (gtwiz_userclk_rx_usrclk2_out)
+   ,.gtwiz_userclk_rx_active_out             (gtwiz_userclk_rx_active_out)
+   ,.gtwiz_reset_clk_freerun_in              (gtwiz_reset_clk_freerun_in)
+   ,.gtwiz_reset_all_in                      (gtwiz_reset_all_in)
+   ,.gtwiz_reset_tx_pll_and_datapath_in      (gtwiz_reset_tx_pll_and_datapath_in)
+   ,.gtwiz_reset_tx_datapath_in              (gtwiz_reset_tx_datapath_in)
+   ,.gtwiz_reset_rx_pll_and_datapath_in      (gtwiz_reset_rx_pll_and_datapath_in)
+   ,.gtwiz_reset_rx_datapath_in              (gtwiz_reset_rx_datapath_in)
+   ,.gtwiz_reset_rx_cdr_stable_out           (gtwiz_reset_rx_cdr_stable_out)
+   ,.gtwiz_reset_tx_done_out                 (gtwiz_reset_tx_done_out)
+   ,.gtwiz_reset_rx_done_out                 (gtwiz_reset_rx_done_out)
+   ,.gtwiz_userdata_tx_in                    (gtwiz_userdata_tx_in)
+   ,.gtwiz_userdata_rx_out                   (gtwiz_userdata_rx_out)
+   ,.drpaddr_in                              (drpaddr_in)
+   ,.drpclk_in                               (drpclk_in)
+   ,.drpdi_in                                (drpdi_in)
+   ,.drpen_in                                (drpen_in)
+   ,.drpwe_in                                (drpwe_in)
+   ,.gtrefclk0_in                            (gtrefclk0_in)
+   ,.loopback_in                             (loopback_in)
+   ,.rx8b10ben_in                            (rx8b10ben_in)
+   ,.rxcommadeten_in                         (1'b1)
+   ,.rxmcommaalignen_in                      (1'b1)
+   ,.rxpcommaalignen_in                      (1'b1)   
+   ,.tx8b10ben_in                            (tx8b10ben_in)
+   ,.txctrl0_in                              (txctrl0_int)
+   ,.txctrl1_in                              (txctrl1_int)
+   ,.txctrl2_in                              (txctrl2_in)
+   ,.cplllock_out                            (cplllock_int)
+   ,.drpdo_out                               (drpdo_out)
+   ,.drprdy_out                              (drprdy_out)
+   ,.gtpowergood_out                         (gtpowergood_int)
+   ,.rxbufstatus_out                         (rxbufstatus_out)
+   ,.rxbyteisaligned_out                     (rxbyteisaligned_out)
+   ,.rxbyterealign_out                       (rxbyterealign_out)
+   ,.rxcommadet_out                          (rxcommadet_out)   
+   ,.rxctrl0_out                             (rxctrl0_int)
+   ,.rxctrl1_out                             (rxctrl1_int)
+   ,.rxctrl2_out                             (rxctrl2_out)
+   ,.rxctrl3_out                             (rxctrl3_out)
+   ,.rxpmaresetdone_out                      (rxpmaresetdone_out)
+   ,.rxsyncdone_out                          (rxsyncdone_int)
+   ,.txbufstatus_out                         (txbufstatus_out)
+   ,.txpmaresetdone_out                      (txpmaresetdone_out)
+);
+
+endmodule
